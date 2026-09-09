@@ -1,0 +1,443 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  EventBridge -> Lambda -> SES resource change alert notifications.
+  Deploy this primary stack in us-east-1 only.
+
+# ============================================================
+# IMPORTANT: Deploy this stack in us-east-1 (N. Virginia).
+# IAM is a global service and CloudTrail delivers IAM API
+# events ONLY to EventBridge in us-east-1.
+# ============================================================
+
+Parameters:
+  AccountAlias:
+    Type: String
+    Description: AWS Account alias label for alert emails (e.g., prod, dev, staging)
+    Default: ""
+  SenderEmail:
+    Type: String
+    Description: SES-verified sender email address (the From address)
+  RecipientEmail:
+    Type: String
+    Description: Email address that receives the alerts
+
+Resources:
+
+  # ----------------------------------------------------------
+  # S3 Bucket for CloudTrail logs
+  # ----------------------------------------------------------
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "cloudtrail-resources-alerts-${AWS::AccountId}"
+      Tags:
+        - Key: Delete
+          Value: Locked
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # ----------------------------------------------------------
+  # CloudTrail Trail - streams management events to EventBridge
+  # ----------------------------------------------------------
+  IamManagementTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: iam-management-events-trail
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true   # Required to capture IAM (global service)
+      IsMultiRegionTrail: true           # Captures events across all regions
+      EnableLogFileValidation: true
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+      Tags:
+        - Key: Delete
+          Value: Locked
+
+  # ----------------------------------------------------------
+  # EventBridge Event Bus Policy - allow CloudTrail to put events
+  # ----------------------------------------------------------
+  EventBridgePolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      StatementId: AllowCloudTrailPutEvents
+      Statement:
+        Effect: Allow
+        Principal:
+          Service: cloudtrail.amazonaws.com
+        Action: events:PutEvents
+        Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+
+  # ----------------------------------------------------------
+  # Central Event Bus (receives events forwarded from regional stacks)
+  # ----------------------------------------------------------
+  CentralEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: resource-change-central-bus
+      Tags:
+        - Key: Delete
+          Value: Locked
+
+  CentralEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref CentralEventBus
+      StatementId: AllowPutEventsFromRegions
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+        Action: events:PutEvents
+        Resource: !GetAtt CentralEventBus.Arn
+
+  # ----------------------------------------------------------
+  # IAM Role for the Lambda notification function
+  # ----------------------------------------------------------
+  NotifyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: resource-change-notifier-role
+      Tags:
+        - Key: Delete
+          Value: Locked
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SesSendEmail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*'
+
+  # ----------------------------------------------------------
+  # Lambda notification function (SAM)
+  # ----------------------------------------------------------
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: resource-change-notifier
+      Handler: notify_handler.lambda_handler
+      Runtime: python3.12
+      CodeUri: src/
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt NotifyFunctionRole.Arn
+      Tags:
+        Delete: Locked
+      Environment:
+        Variables:
+          ACCOUNT_ALIAS: !Ref AccountAlias
+          SENDER_EMAIL:  !Ref SenderEmail
+          RECIPIENT_EMAIL: !Ref RecipientEmail
+
+  # Allow EventBridge default bus rules to invoke the function
+  NotifyFunctionPermissionDefaultBus:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotifyFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  # Allow EventBridge central bus rules to invoke the function
+  NotifyFunctionPermissionCentralBus:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotifyFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${CentralEventBus}/*"
+
+  # ----------------------------------------------------------
+  # IAM Events Rule (global service, default bus, us-east-1 only)
+  # ----------------------------------------------------------
+  NotifyIamChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-IAM-Changes
+      Description: Monitor IAM role, user, and policy lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - CreateRole
+            - DeleteRole
+            - UpdateRole
+            - PutRolePolicy
+            - DeleteRolePolicy
+            - AttachRolePolicy
+            - DetachRolePolicy
+            - CreateUser
+            - DeleteUser
+            - PutUserPolicy
+            - DeleteUserPolicy
+            - AttachUserPolicy
+            - DetachUserPolicy
+            - CreatePolicy
+            - DeletePolicy
+            - CreateAccessKey
+            - DeleteAccessKey
+      Targets:
+        - Id: lambda-iam-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+  # ----------------------------------------------------------
+  # Lambda Events Rule (central bus)
+  # ----------------------------------------------------------
+  NotifyLambdaChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-Lambda-Changes
+      Description: Monitor Lambda function lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - prefix: CreateFunction
+            - prefix: DeleteFunction
+            - prefix: UpdateFunctionConfiguration
+      Targets:
+        - Id: lambda-lambda-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+  # ----------------------------------------------------------
+  # EC2 Events Rule (central bus)
+  # ----------------------------------------------------------
+  NotifyEc2ChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-EC2-Changes
+      Description: Monitor EC2 instance and security group lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - RunInstances
+            - TerminateInstances
+            - StopInstances
+            - StartInstances
+            - RebootInstances
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+            - AuthorizeSecurityGroupIngress
+            - RevokeSecurityGroupIngress
+            - CreateVolume
+            - DeleteVolume
+            - AttachVolume
+            - DetachVolume
+      Targets:
+        - Id: lambda-ec2-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+  # ----------------------------------------------------------
+  # S3 Events Rule (central bus)
+  # ----------------------------------------------------------
+  NotifyS3ChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-S3-Changes
+      Description: Monitor S3 bucket lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - CreateBucket
+            - DeleteBucket
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - PutBucketEncryption
+            - DeleteBucketEncryption
+            - PutBucketVersioning
+            - PutBucketLogging
+      Targets:
+        - Id: lambda-s3-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+  # ----------------------------------------------------------
+  # RDS Events Rule (central bus)
+  # ----------------------------------------------------------
+  NotifyRdsChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-RDS-Changes
+      Description: Monitor RDS instance and cluster lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.rds
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - CreateDBInstance
+            - DeleteDBInstance
+            - ModifyDBInstance
+            - RebootDBInstance
+            - CreateDBCluster
+            - DeleteDBCluster
+            - ModifyDBCluster
+            - CreateDBSnapshot
+            - DeleteDBSnapshot
+      Targets:
+        - Id: lambda-rds-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+  # ----------------------------------------------------------
+  # DynamoDB Events Rule (central bus)
+  # ----------------------------------------------------------
+  NotifyDynamodbChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-DynamoDB-Changes
+      Description: Monitor DynamoDB table lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.dynamodb
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - CreateTable
+            - DeleteTable
+            - UpdateTable
+            - CreateGlobalSecondaryIndex
+            - DeleteGlobalSecondaryIndex
+            - CreateBackup
+            - DeleteBackup
+      Targets:
+        - Id: lambda-dynamodb-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+  # ----------------------------------------------------------
+  # KMS Events Rule (central bus)
+  # ----------------------------------------------------------
+  NotifyKmsChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Notify-KMS-Changes
+      Description: Monitor KMS key lifecycle events
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.kms
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - CreateKey
+            - ScheduleKeyDeletion
+            - CancelKeyDeletion
+            - DisableKey
+            - EnableKey
+            - UpdateKeyDescription
+            - CreateAlias
+            - DeleteAlias
+      Targets:
+        - Id: lambda-kms-target
+          Arn: !GetAtt NotifyFunction.Arn
+
+Outputs:
+  CloudTrailName:
+    Description: Name of the CloudTrail trail created
+    Value: !Ref IamManagementTrail
+
+  CentralEventBusArn:
+    Description: Central Event Bus ARN - use this for regional deployments
+    Value: !GetAtt CentralEventBus.Arn
+
+  S3BucketName:
+    Description: S3 bucket storing CloudTrail logs (retained on stack delete)
+    Value: !Ref CloudTrailLogsBucket
+
+  NotifyFunctionArn:
+    Description: Lambda function ARN for resource change notifications
+    Value: !GetAtt NotifyFunction.Arn

@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EventBridge rules for regional resource monitoring (deploy in each region)
+
+# ============================================================
+# Deploy this template in each region where you want to monitor
+# resources (us-west-1, us-west-2, eu-west-1, ap-southeast-1, etc.)
+#
+# This routes regional events to the central event bus in us-east-1
+# ============================================================
+
+Parameters:
+  CentralEventBusArn:
+    Type: String
+    Description: ARN of the central event bus in us-east-1 (e.g., arn:aws:events:us-east-1:123456789012:event-bus/resource-change-central-bus)
+
+Resources:
+
+  # ----------------------------------------------------------
+  # Lambda Events Rule (routes to central bus)
+  # ----------------------------------------------------------
+  RouteLambdaEventsToCentral:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Route-Lambda-to-Central-Bus
+      Description: Route Lambda events to central event bus in us-east-1
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - prefix: CreateFunction
+            - prefix: DeleteFunction
+            - prefix: UpdateFunctionConfiguration
+      Targets:
+        - Id: central-bus-lambda
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeCentralBusRole.Arn
+
+  # ----------------------------------------------------------
+  # EC2 Events Rule (routes to central bus)
+  # ----------------------------------------------------------
+  RouteEc2EventsToCentral:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Route-EC2-to-Central-Bus
+      Description: Route EC2 events to central event bus in us-east-1
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - RunInstances
+            - TerminateInstances
+            - StopInstances
+            - StartInstances
+            - RebootInstances
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+            - AuthorizeSecurityGroupIngress
+            - RevokeSecurityGroupIngress
+            - CreateVolume
+            - DeleteVolume
+            - AttachVolume
+            - DetachVolume
+      Targets:
+        - Id: central-bus-ec2
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeCentralBusRole.Arn
+
+  # ----------------------------------------------------------
+  # S3 Events Rule (routes to central bus)
+  # ----------------------------------------------------------
+  RouteS3EventsToCentral:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Route-S3-to-Central-Bus
+      Description: Route S3 events to central event bus in us-east-1
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - CreateBucket
+            - DeleteBucket
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - PutBucketEncryption
+            - DeleteBucketEncryption
+            - PutBucketVersioning
+            - PutBucketLogging
+      Targets:
+        - Id: central-bus-s3
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeCentralBusRole.Arn
+
+  # ----------------------------------------------------------
+  # RDS Events Rule (routes to central bus)
+  # ----------------------------------------------------------
+  RouteRdsEventsToCentral:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Route-RDS-to-Central-Bus
+      Description: Route RDS events to central event bus in us-east-1
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.rds
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - rds.amazonaws.com
+          eventName:
+            - CreateDBInstance
+            - DeleteDBInstance
+            - ModifyDBInstance
+            - RebootDBInstance
+            - CreateDBCluster
+            - DeleteDBCluster
+            - ModifyDBCluster
+            - CreateDBSnapshot
+            - DeleteDBSnapshot
+      Targets:
+        - Id: central-bus-rds
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeCentralBusRole.Arn
+
+  # ----------------------------------------------------------
+  # DynamoDB Events Rule (routes to central bus)
+  # ----------------------------------------------------------
+  RouteDynamodbEventsToCentral:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Route-DynamoDB-to-Central-Bus
+      Description: Route DynamoDB events to central event bus in us-east-1
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.dynamodb
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - dynamodb.amazonaws.com
+          eventName:
+            - CreateTable
+            - DeleteTable
+            - UpdateTable
+            - CreateGlobalSecondaryIndex
+            - DeleteGlobalSecondaryIndex
+            - CreateBackup
+            - DeleteBackup
+      Targets:
+        - Id: central-bus-dynamodb
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeCentralBusRole.Arn
+
+  # ----------------------------------------------------------
+  # KMS Events Rule (routes to central bus)
+  # ----------------------------------------------------------
+  RouteKmsEventsToCentral:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Route-KMS-to-Central-Bus
+      Description: Route KMS events to central event bus in us-east-1
+      Tags:
+        - Key: Delete
+          Value: Locked
+      State: ENABLED
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.kms
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - kms.amazonaws.com
+          eventName:
+            - CreateKey
+            - ScheduleKeyDeletion
+            - CancelKeyDeletion
+            - DisableKey
+            - EnableKey
+            - UpdateKeyDescription
+            - CreateAlias
+            - DeleteAlias
+      Targets:
+        - Id: central-bus-kms
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeCentralBusRole.Arn
+
+  # ----------------------------------------------------------
+  # IAM Role for regional EventBridge to put events on central bus
+  # ----------------------------------------------------------
+  EventBridgeCentralBusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "EventBridge-Central-Bus-Route-${AWS::Region}"
+      Tags:
+        - Key: Delete
+          Value: Locked
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowPutEventsToCentralBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralEventBusArn
