@@ -2,8 +2,39 @@ import os
 from datetime import datetime
 
 import boto3
+import json
 
 ses = boto3.client("ses", region_name="us-east-1")
+
+# ── Exception rules ────────────────────────────────────────────────────────────
+
+def _load_exceptions():
+    path = os.path.join(os.path.dirname(__file__), "exceptions.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("exceptions", [])
+    except FileNotFoundError:
+        return []
+
+_EXCEPTIONS = _load_exceptions()
+
+
+def _is_suppressed(action, caller_arn, resource, account_id, region):
+    """Return True if the event matches any exception rule (all fields must match)."""
+    for rule in _EXCEPTIONS:
+        if rule.get("action") and not action.startswith(rule["action"]):
+            continue
+        if rule.get("caller_arn_pattern") and rule["caller_arn_pattern"] not in caller_arn:
+            continue
+        if rule.get("resource") and rule["resource"] != resource:
+            continue
+        if rule.get("account_id") and rule["account_id"] != account_id:
+            continue
+        if rule.get("region") and rule["region"] != region:
+            continue
+        return True
+    return False
 
 # ── Per-service display metadata ───────────────────────────────────────────────
 SERVICE_META = {
@@ -215,6 +246,10 @@ def lambda_handler(event, context):
         time_fmt = time_raw or "Unknown"
 
     resource = _extract_resource(event_source, req_params)
+
+    if _is_suppressed(action, who, resource or "", account_id, region):
+        return {"statusCode": 200, "suppressed": True}
+
     subject  = f"AWS {meta['name']} — {action} ({account_alias})"
 
     html_body = _build_html(

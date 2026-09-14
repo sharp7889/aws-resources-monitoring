@@ -100,6 +100,7 @@ Emails are HTML with a colour-coded header per service, a clean detail table, a 
 - `template.yaml` — Primary stack (us-east-1): CloudTrail, central bus, Lambda function, SES delivery, IAM rules
 - `regional-rules.yaml` — Regional stack: EventBridge rules forwarding to central bus
 - `src/notify_handler.py` — Lambda function: parses events, builds HTML, sends via SES
+- `src/exceptions.json` — Exception rules to suppress alerts for specific events
 - `deploy.sh` — Automated deployment script
 - `samconfig.toml` — SAM configuration defaults
 
@@ -124,6 +125,66 @@ Emails are HTML with a colour-coded header per service, a clean detail table, a 
 | EventBridge Rules | `Route-*-to-Central-Bus` | Lambda, EC2, S3, RDS, DynamoDB, KMS rules |
 
 All resources are tagged with: `Delete: Locked`
+
+## Exception Rules (exceptions.json)
+
+Use `src/exceptions.json` to suppress alerts for known, safe events. The Lambda function evaluates each incoming event against the exception rules; if ALL specified fields match, the event is silently dropped and no email is sent.
+
+### Exception Rule Structure
+
+```json
+{
+  "exceptions": [
+    {
+      "description": "Human-readable reason (optional)",
+      "action": "EventName prefix to match",
+      "caller_arn_pattern": "Substring to match in caller ARN",
+      "resource": "Exact resource name (optional)",
+      "account_id": "12-digit account ID (optional)",
+      "region": "AWS region, e.g. us-west-2 (optional)"
+    }
+  ]
+}
+```
+
+### Fields
+
+| Field | Match Type | Optional | Example |
+|-------|------------|----------|---------|
+| `description` | — | Yes | Reason for the rule |
+| `action` | Prefix match on `eventName` | No | `UpdateFunctionConfiguration` (matches `UpdateFunctionConfigurationX` too) |
+| `caller_arn_pattern` | Substring match on caller ARN | No | `assumed-role` (matches any IAM assumed role) |
+| `resource` | Exact match | Yes | `my-function-name` |
+| `account_id` | Exact 12-digit match | Yes | `123456789012` |
+| `region` | Exact match | Yes | `us-west-2` |
+
+### Example Rules
+
+**Suppress self-updating Lambda functions:**
+```json
+{
+  "action": "UpdateFunctionConfiguration",
+  "caller_arn_pattern": "assumed-role/my-lambda-role"
+}
+```
+
+**Suppress infrastructure deployments in dev account:**
+```json
+{
+  "action": "CreateFunction",
+  "caller_arn_pattern": "arn:aws:iam::DEV_ACCOUNT:role/deployment-role",
+  "region": "us-west-2"
+}
+```
+
+**Suppress RDS maintenance in specific account:**
+```json
+{
+  "action": "ModifyDBInstance",
+  "account_id": "123456789012",
+  "caller_arn_pattern": "RDS-managed"
+}
+```
 
 ## Prerequisites
 

@@ -1,0 +1,30 @@
+{
+  "_comment": "Notification exception rules. Copy this to exceptions.json and customize for your environment. Each rule matches when ALL specified fields match the incoming event. Matched events are silently dropped (no email sent). Fields: action (eventName prefix), caller_arn_pattern (substring in caller ARN), resource (exact name), account_id (12-digit), region (e.g. us-west-2).",
+  "exceptions": [
+    {
+      "description": "Ignore Lambda function self-updates",
+      "action": "UpdateFunctionConfiguration",
+      "caller_arn_pattern": "assumed-role"
+    },
+    {
+      "description": "Ignore specific Lambda function updates",
+      "action": "UpdateFunctionCode",
+      "resource": "my-function-name"
+    },
+    {
+      "description": "Ignore all EC2 actions in dev account",
+      "action": "Run",
+      "account_id": "123456789012"
+    },
+    {
+      "description": "Ignore S3 operations by automation role",
+      "caller_arn_pattern": "automation-role",
+      "resource": "my-bucket-name"
+    },
+    {
+      "description": "Ignore DynamoDB updates in us-west-2 region",
+      "action": "UpdateTable",
+      "region": "us-west-2"
+    }
+  ]
+}
