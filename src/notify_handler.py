@@ -58,6 +58,29 @@ def _ec2_resource(params):
     return params.get("groupId") or params.get("volumeId")
 
 
+def _iam_resource(params):
+    # Identify the principal (user / role / group) being acted on
+    principal = (
+        params.get("userName")
+        or params.get("roleName")
+        or params.get("groupName")
+        or params.get("policyName")
+    )
+
+    # For attach/detach managed-policy actions, also capture the policy ARN
+    policy_arn = params.get("policyArn")
+
+    # For inline-policy actions (PutRolePolicy / PutUserPolicy / DeleteRolePolicy …)
+    # the inline policy name lives in "policyName"
+    inline_policy = params.get("policyName") if principal != params.get("policyName") else None
+
+    attached = policy_arn or inline_policy
+
+    if principal and attached:
+        return f"{principal}  →  {attached}"
+    return principal or attached or None
+
+
 def _extract_resource(service, params):
     if not params:
         return None
@@ -65,10 +88,7 @@ def _extract_resource(service, params):
         "lambda.amazonaws.com":   lambda p: p.get("functionName"),
         "s3.amazonaws.com":       lambda p: p.get("bucketName"),
         "dynamodb.amazonaws.com": lambda p: p.get("tableName"),
-        "iam.amazonaws.com":      lambda p: (
-            p.get("roleName") or p.get("userName")
-            or p.get("policyName") or p.get("groupName")
-        ),
+        "iam.amazonaws.com":      _iam_resource,
         "rds.amazonaws.com":      lambda p: (
             p.get("dBInstanceIdentifier")
             or p.get("dBClusterIdentifier")
