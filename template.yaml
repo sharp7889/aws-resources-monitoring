@@ -256,6 +256,7 @@ Resources:
             - prefix: CreateFunction
             - prefix: DeleteFunction
             - prefix: UpdateFunctionConfiguration
+            - prefix: UpdateFunctionCode
       Targets:
         - Id: lambda-lambda-target
           Arn: !GetAtt NotifyFunction.Arn
