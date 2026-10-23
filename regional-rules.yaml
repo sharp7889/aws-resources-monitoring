@@ -40,6 +40,7 @@ Resources:
             - prefix: CreateFunction
             - prefix: DeleteFunction
             - prefix: UpdateFunctionConfiguration
+            - prefix: UpdateFunctionCode
       Targets:
         - Id: central-bus-lambda
           Arn: !Ref CentralEventBusArn

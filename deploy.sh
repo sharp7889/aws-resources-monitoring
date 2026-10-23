@@ -174,6 +174,7 @@ PROFILE=""
 ACCOUNT_ALIAS=""
 SENDER_EMAIL=""
 EMAIL_ADDRESS=""
+PRIMARY_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -181,9 +182,10 @@ while [[ $# -gt 0 ]]; do
     --account-alias)  ACCOUNT_ALIAS="$2"; shift 2 ;;
     --sender-email)   SENDER_EMAIL="$2";  shift 2 ;;
     --email)          EMAIL_ADDRESS="$2"; shift 2 ;;
+    --primary-only)   PRIMARY_ONLY=true;  shift 1 ;;
     *)
       echo -e "${RED}Unknown option: $1${RESET}"
-      echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT"
+      echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT [--primary-only]"
       exit 1
       ;;
   esac
@@ -191,22 +193,22 @@ done
 
 if [ -z "$PROFILE" ]; then
   print_error "--profile is required"
-  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT"
+  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT [--primary-only]"
   exit 1
 fi
 if [ -z "$ACCOUNT_ALIAS" ]; then
   print_error "--account-alias is required"
-  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT"
+  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT [--primary-only]"
   exit 1
 fi
 if [ -z "$SENDER_EMAIL" ]; then
   print_error "--sender-email is required  (must be verified in AWS SES)"
-  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT"
+  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT [--primary-only]"
   exit 1
 fi
 if [ -z "$EMAIL_ADDRESS" ]; then
   print_error "--email (recipient) is required"
-  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT"
+  echo "Usage: $0 --profile PROFILE --account-alias ALIAS --sender-email SENDER --email RECIPIENT [--primary-only]"
   exit 1
 fi
 
@@ -224,7 +226,11 @@ echo -e "  ${GRAY}Profile      :${RESET} ${BOLD}${PROFILE}${RESET}"
 echo -e "  ${GRAY}Account Alias:${RESET} ${BOLD}${ACCOUNT_ALIAS}${RESET}"
 echo -e "  ${GRAY}Sender       :${RESET} ${BOLD}${SENDER_EMAIL}${RESET}"
 echo -e "  ${GRAY}Recipient    :${RESET} ${BOLD}${EMAIL_ADDRESS}${RESET}"
-echo -e "  ${GRAY}Regions      :${RESET} ${BOLD}${TOTAL_REGIONS} regions${RESET}"
+if [ "$PRIMARY_ONLY" = true ]; then
+  echo -e "  ${GRAY}Mode         :${RESET} ${YELLOW}Primary stack only${RESET}"
+else
+  echo -e "  ${GRAY}Regions      :${RESET} ${BOLD}${TOTAL_REGIONS} regions${RESET}"
+fi
 echo -e "  ${GRAY}Logs         :${RESET} ${DIM}${LOG_DIR}/${RESET}"
 
 # ─── Step 1: Primary Stack ────────────────────────────────────────────────────
@@ -250,88 +256,99 @@ spinner $SAM_PID "Deploying primary stack to us-east-1"
 wait $SAM_PID
 print_success "Primary stack deployed  ${GRAY}(log: ${LOG_FILE})${RESET}"
 
-# ─── Step 2: Get Central Event Bus ARN ───────────────────────────────────────
-print_step "2/5" "Fetching Central Event Bus ARN"
+if [ "$PRIMARY_ONLY" = false ]; then
+  # ─── Step 2: Get Central Event Bus ARN ───────────────────────────────────────
+  print_step "2/5" "Fetching Central Event Bus ARN"
 
-CENTRAL_BUS_ARN=$(aws cloudformation describe-stacks \
-  --stack-name resource-change-alerts \
-  --region us-east-1 \
-  --query 'Stacks[0].Outputs[?OutputKey==`CentralEventBusArn`].OutputValue' \
-  --output text \
-  $AWS_OPTS)
+  CENTRAL_BUS_ARN=$(aws cloudformation describe-stacks \
+    --stack-name resource-change-alerts \
+    --region us-east-1 \
+    --query 'Stacks[0].Outputs[?OutputKey==`CentralEventBusArn`].OutputValue' \
+    --output text \
+    $AWS_OPTS)
 
-print_success "Central Event Bus ARN fetched"
-echo -e "  ${GRAY}ARN:${RESET} ${DIM}${CENTRAL_BUS_ARN}${RESET}"
+  print_success "Central Event Bus ARN fetched"
+  echo -e "  ${GRAY}ARN:${RESET} ${DIM}${CENTRAL_BUS_ARN}${RESET}"
 
-# ─── Step 3: Regional Stacks ──────────────────────────────────────────────────
-print_step "3/5" "Deploy regional stacks  →  ${TOTAL_REGIONS} regions"
-echo ""
-
-idx=0
-for REGION in "${REGIONS[@]}"; do
-  idx=$((idx + 1))
-  LOG_FILE="${LOG_DIR}/regional-${REGION}.log"
-
-  # Progress indicator
-  PERCENT=$(( idx * 100 / TOTAL_REGIONS ))
-  FILLED=$(( idx * 20 / TOTAL_REGIONS ))
-  BAR=""
-  for ((f=0; f<FILLED; f++));   do BAR+="█"; done
-  for ((f=FILLED; f<20; f++)); do BAR+="░"; done
-
-  printf "  ${GRAY}[${idx}/${TOTAL_REGIONS}]${RESET} ${CYAN}%s${RESET}\n" "$REGION"
-  printf "  ${BLUE}${BAR}${RESET} ${DIM}${PERCENT}%%${RESET}\n"
-
-  # ── Resolve any pre-existing stack state ─────────────────────────────────
-  PREP_RC=0
-  prepare_region_stack "resource-change-alerts-regional" "$REGION" || PREP_RC=$?
-
-  if [ "$PREP_RC" -eq 2 ]; then
-    REGION_STATUS[$idx]="!"
-    REGION_DURATION[$idx]="manual fix"
-    echo ""
-    continue
-  fi
-
-  START_TS=$(date +%s)
-
-  sam deploy \
-    --stack-name resource-change-alerts-regional \
-    --template-file regional-rules.yaml \
-    --parameter-overrides CentralEventBusArn=$CENTRAL_BUS_ARN \
-    --capabilities CAPABILITY_NAMED_IAM \
-    --no-confirm-changeset \
-    --no-fail-on-empty-changeset \
-    --region "$REGION" \
-    $AWS_OPTS > "$LOG_FILE" 2>&1 &
-
-  SAM_PID=$!
-  spinner $SAM_PID "  Deploying $REGION"
-
-  END_TS=$(date +%s)
-  DURATION=$(( END_TS - START_TS ))
-
-  if wait $SAM_PID; then
-    REGION_STATUS[$idx]="✔"
-    REGION_DURATION[$idx]="${DURATION}s"
-    print_success "${REGION}  ${GRAY}(${DURATION}s)${RESET}"
-  else
-    REGION_STATUS[$idx]="✘"
-    REGION_DURATION[$idx]="${DURATION}s"
-    print_error "${REGION} failed  ${GRAY}— see ${LOG_FILE}${RESET}"
-    # Don't exit; continue so we get a full summary
-  fi
+  # ─── Step 3: Regional Stacks ──────────────────────────────────────────────────
+  print_step "3/5" "Deploy regional stacks  →  ${TOTAL_REGIONS} regions"
   echo ""
-done
 
-# ─── Step 4: SES Verification Reminder ──────────────────────────────────────
-print_step "4/4" "SES setup reminder"
+  idx=0
+  for REGION in "${REGIONS[@]}"; do
+    idx=$((idx + 1))
+    LOG_FILE="${LOG_DIR}/regional-${REGION}.log"
+
+    # Progress indicator
+    PERCENT=$(( idx * 100 / TOTAL_REGIONS ))
+    FILLED=$(( idx * 20 / TOTAL_REGIONS ))
+    BAR=""
+    for ((f=0; f<FILLED; f++));   do BAR+="█"; done
+    for ((f=FILLED; f<20; f++)); do BAR+="░"; done
+
+    printf "  ${GRAY}[${idx}/${TOTAL_REGIONS}]${RESET} ${CYAN}%s${RESET}\n" "$REGION"
+    printf "  ${BLUE}${BAR}${RESET} ${DIM}${PERCENT}%%${RESET}\n"
+
+    # ── Resolve any pre-existing stack state ─────────────────────────────────
+    PREP_RC=0
+    prepare_region_stack "resource-change-alerts-regional" "$REGION" || PREP_RC=$?
+
+    if [ "$PREP_RC" -eq 2 ]; then
+      REGION_STATUS[$idx]="!"
+      REGION_DURATION[$idx]="manual fix"
+      echo ""
+      continue
+    fi
+
+    START_TS=$(date +%s)
+
+    sam deploy \
+      --stack-name resource-change-alerts-regional \
+      --template-file regional-rules.yaml \
+      --parameter-overrides CentralEventBusArn=$CENTRAL_BUS_ARN \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --no-confirm-changeset \
+      --no-fail-on-empty-changeset \
+      --region "$REGION" \
+      $AWS_OPTS > "$LOG_FILE" 2>&1 &
+
+    SAM_PID=$!
+    spinner $SAM_PID "  Deploying $REGION"
+
+    END_TS=$(date +%s)
+    DURATION=$(( END_TS - START_TS ))
+
+    if wait $SAM_PID; then
+      REGION_STATUS[$idx]="✔"
+      REGION_DURATION[$idx]="${DURATION}s"
+      print_success "${REGION}  ${GRAY}(${DURATION}s)${RESET}"
+    else
+      REGION_STATUS[$idx]="✘"
+      REGION_DURATION[$idx]="${DURATION}s"
+      print_error "${REGION} failed  ${GRAY}— see ${LOG_FILE}${RESET}"
+      # Don't exit; continue so we get a full summary
+    fi
+    echo ""
+  done
+fi
+
+if [ "$PRIMARY_ONLY" = false ]; then
+  # ─── Step 4: SES Verification Reminder ──────────────────────────────────────
+  print_step "4/5" "SES setup reminder"
+else
+  # ─── Step 2: SES Verification Reminder ──────────────────────────────────────
+  print_step "2/2" "SES setup reminder"
+fi
 
 print_success "Lambda function deployed and wired to EventBridge"
 print_warn  "Ensure your sender email is verified in SES before alerts will send:"
 echo -e "  ${GRAY}aws ses verify-email-identity --email-address ${SENDER_EMAIL} --region us-east-1 --profile ${PROFILE}${RESET}"
 print_info  "If your SES account is in sandbox mode, the recipient must also be verified:"
 echo -e "  ${GRAY}aws ses verify-email-identity --email-address ${EMAIL_ADDRESS} --region us-east-1 --profile ${PROFILE}${RESET}"
+
+if [ "$PRIMARY_ONLY" = false ]; then
+  print_info "Regional stacks deployed to ${TOTAL_REGIONS} regions. To update them later, run with --primary-only to update only the primary stack."
+fi
 
 # ─── Summary Table ────────────────────────────────────────────────────────────
 echo ""
@@ -344,26 +361,28 @@ echo -e "${BOLD}${BLUE}║${RESET}  ${GRAY}────────────�
 # Primary stack row
 printf "${BOLD}${BLUE}║${RESET}  %-28s ${GREEN}%-10s${RESET} %-10s ${BOLD}${BLUE}║${RESET}\n" "us-east-1 (primary)" "✔ OK" ""
 
-idx=0
-for REGION in "${REGIONS[@]}"; do
-  idx=$((idx + 1))
-  STATUS="${REGION_STATUS[$idx]}"
-  DUR="${REGION_DURATION[$idx]}"
-  if [ "$STATUS" = "✔" ]; then
-    COLOR="$GREEN"
-    LABEL="✔ OK"
-  elif [ "$STATUS" = "↷" ]; then
-    COLOR="$GRAY"
-    LABEL="↷ skipped"
-  elif [ "$STATUS" = "!" ]; then
-    COLOR="$YELLOW"
-    LABEL="! manual fix"
-  else
-    COLOR="$RED"
-    LABEL="✘ FAILED"
-  fi
-  printf "${BOLD}${BLUE}║${RESET}  %-28s ${COLOR}%-10s${RESET} %-10s ${BOLD}${BLUE}║${RESET}\n" "$REGION" "$LABEL" "$DUR"
-done
+if [ "$PRIMARY_ONLY" = false ]; then
+  idx=0
+  for REGION in "${REGIONS[@]}"; do
+    idx=$((idx + 1))
+    STATUS="${REGION_STATUS[$idx]}"
+    DUR="${REGION_DURATION[$idx]}"
+    if [ "$STATUS" = "✔" ]; then
+      COLOR="$GREEN"
+      LABEL="✔ OK"
+    elif [ "$STATUS" = "↷" ]; then
+      COLOR="$GRAY"
+      LABEL="↷ skipped"
+    elif [ "$STATUS" = "!" ]; then
+      COLOR="$YELLOW"
+      LABEL="! manual fix"
+    else
+      COLOR="$RED"
+      LABEL="✘ FAILED"
+    fi
+    printf "${BOLD}${BLUE}║${RESET}  %-28s ${COLOR}%-10s${RESET} %-10s ${BOLD}${BLUE}║${RESET}\n" "$REGION" "$LABEL" "$DUR"
+  done
+fi
 
 echo -e "${BOLD}${BLUE}╠══════════════════════════════════════════════════════╣${RESET}"
 echo -e "${BOLD}${BLUE}║${RESET}  ${GRAY}Profile      :${RESET} ${BOLD}${PROFILE}${RESET}"
